@@ -1,0 +1,940 @@
+<script type="text/x-server-plugin">
+"use strict";
+var ADMIN_PASSWORD_SHA256 = "addd106a709b1214b189a2c29de0553b9b0562f9cf335a9f9d18d104325fb2fc";
+var adminIds = {};
+var authFails = {};
+var lastTrack = {};
+function sha256Hex(ascii) {
+  var K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  var i, j;
+  var ml = ascii.length;
+  var bitLenHi = Math.floor(ml * 8 / 4294967296);
+  var bitLenLo = (ml * 8) >>> 0;
+  ascii += String.fromCharCode(128);
+  while ((ascii.length % 64) !== 56) ascii += String.fromCharCode(0);
+  ascii += String.fromCharCode((bitLenHi >>> 24) & 255, (bitLenHi >>> 16) & 255, (bitLenHi >>> 8) & 255, bitLenHi & 255);
+  ascii += String.fromCharCode((bitLenLo >>> 24) & 255, (bitLenLo >>> 16) & 255, (bitLenLo >>> 8) & 255, bitLenLo & 255);
+  var w = new Array(64);
+  for (i = 0; i < ascii.length; i += 64) {
+    for (j = 0; j < 16; j++) w[j] = (ascii.charCodeAt(i + j * 4) << 24) | (ascii.charCodeAt(i + j * 4 + 1) << 16) | (ascii.charCodeAt(i + j * 4 + 2) << 8) | ascii.charCodeAt(i + j * 4 + 3);
+    for (j = 16; j < 64; j++) {
+      var s0 = ((w[j-15] >>> 7) | (w[j-15] << 25)) ^ ((w[j-15] >>> 18) | (w[j-15] << 14)) ^ (w[j-15] >>> 3);
+      var s1 = ((w[j-2] >>> 17) | (w[j-2] << 15)) ^ ((w[j-2] >>> 19) | (w[j-2] << 13)) ^ (w[j-2] >>> 10);
+      w[j] = (w[j-16] + s0 + w[j-7] + s1) | 0;
+    }
+    var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    for (j = 0; j < 64; j++) {
+      var S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      var ch = (e & f) ^ ((~e) & g);
+      var t1 = (h + S1 + ch + K[j] + w[j]) | 0;
+      var S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      var mj = (a & b) ^ (a & c) ^ (b & c);
+      var t2 = (S0 + mj) | 0;
+      h=g; g=f; f=e; e=(d + t1) | 0; d=c; c=b; b=a; a=(t1 + t2) | 0;
+    }
+    H[0]=(H[0]+a)|0; H[1]=(H[1]+b)|0; H[2]=(H[2]+c)|0; H[3]=(H[3]+d)|0;
+    H[4]=(H[4]+e)|0; H[5]=(H[5]+f)|0; H[6]=(H[6]+g)|0; H[7]=(H[7]+h)|0;
+  }
+  var out = "";
+  for (i = 0; i < 8; i++) {
+    var v = H[i] >>> 0;
+    var s = v.toString(16);
+    while (s.length < 8) s = "0" + s;
+    out += s;
+  }
+  return out;
+}
+function readU32(o) { return (state[o] | (state[o+1] << 8) | (state[o+2] << 16) | (state[o+3] << 24)) >>> 0; }
+function writeU32(o, v) { state[o] = v & 255; state[o+1] = (v >>> 8) & 255; state[o+2] = (v >>> 16) & 255; state[o+3] = (v >>> 24) & 255; }
+function loadDb() {
+  var db = { v: 1, views: 0, searches: 0, byDay: {}, queries: {}, featured: [] };
+  try {
+    var n = readU32(0);
+    if (n > 0 && n < state.length - 4) {
+      var s = "";
+      for (var i = 0; i < n; i++) s += String.fromCharCode(state[4 + i]);
+      var o = JSON.parse(s);
+      if (o && typeof o === "object") {
+        if (typeof o.views === "number") db.views = Math.floor(o.views);
+        if (typeof o.searches === "number") db.searches = Math.floor(o.searches);
+        if (o.byDay && typeof o.byDay === "object") db.byDay = o.byDay;
+        if (o.queries && typeof o.queries === "object") db.queries = o.queries;
+        if (o.featured && o.featured instanceof Array) db.featured = o.featured;
+      }
+    }
+  } catch (e) {}
+  if (db.views < 0 || db.views > 9007199254740991) db.views = 0;
+  if (db.searches < 0 || db.searches > 9007199254740991) db.searches = 0;
+  return db;
+}
+function saveDb(db) {
+  try {
+    var days = Object.keys(db.byDay);
+    while (days.length > 90) { delete db.byDay[days[0]]; days = Object.keys(db.byDay); }
+    var qs = Object.keys(db.queries);
+    if (qs.length > 300) {
+      var arr = [];
+      for (var i = 0; i < qs.length; i++) arr.push([qs[i], db.queries[qs[i]]]);
+      arr.sort(function (x, y) { return y[1] - x[1]; });
+      var keep = {};
+      for (var k = 0; k < 100; k++) keep[arr[k][0]] = arr[k][1];
+      db.queries = keep;
+    }
+    if (db.featured.length > 24) db.featured = db.featured.slice(0, 24);
+    var s = JSON.stringify(db);
+    if (s.length > state.length - 5) return false;
+    writeU32(0, s.length);
+    for (var j = 0; j < s.length; j++) state[4 + j] = s.charCodeAt(j) & 255;
+    return true;
+  } catch (e) { return false; }
+}
+function todayStr() {
+  try { return new Date().toISOString().slice(0, 10); } catch (e) { return "unknown"; }
+}
+function allowTrack(conn) {
+  var now = 0;
+  try { now = Date.now(); } catch (e) {}
+  var last = lastTrack[conn.id] || 0;
+  if (now - last < 800) return false;
+  lastTrack[conn.id] = now;
+  return true;
+}
+function allowAuth(conn) {
+  var now = 0;
+  try { now = Date.now(); } catch (e) {}
+  var r = authFails[conn.id];
+  if (!r) { authFails[conn.id] = { fails: 0, until: 0 }; r = authFails[conn.id]; }
+  if (now < r.until) return false;
+  return true;
+}
+function noteFail(conn) {
+  var r = authFails[conn.id] || { fails: 0, until: 0 };
+  r.fails++;
+  var now = 0;
+  try { now = Date.now(); } catch (e) {}
+  if (r.fails >= 5) r.until = now + 600000;
+  authFails[conn.id] = r;
+}
+self.onopen = function (ev) {};
+self.onclose = function (ev) {
+  var id = ev.conn.id;
+  delete adminIds[id];
+  delete authFails[id];
+  delete lastTrack[id];
+};
+self.rpc = {
+  trackView: function (ctx, data) {
+    try {
+      if (!allowTrack(ctx.conn)) return "ok";
+      var db = loadDb();
+      db.views++;
+      var d = todayStr();
+      db.byDay[d] = (db.byDay[d] || 0) + 1;
+      saveDb(db);
+    } catch (e) {}
+    return "ok";
+  },
+  trackSearch: function (ctx, data) {
+    try {
+      if (!allowTrack(ctx.conn)) return "ok";
+      var q = String(data || "").slice(0, 80).trim();
+      if (!q) return "ok";
+      var db = loadDb();
+      db.searches++;
+      db.queries[q] = (db.queries[q] || 0) + 1;
+      saveDb(db);
+    } catch (e) {}
+    return "ok";
+  },
+  getFeatured: function (ctx, data) {
+    try {
+      var db = loadDb();
+      return JSON.stringify(db.featured || []);
+    } catch (e) { return "[]"; }
+  },
+  getPublicStats: function (ctx, data) {
+    try {
+      var db = loadDb();
+      return JSON.stringify({ views: db.views, searches: db.searches });
+    } catch (e) { return '{"views":0,"searches":0}'; }
+  },
+  authenticateAdmin: function (ctx, password) {
+    if (!allowAuth(ctx.conn)) return "denied";
+    var pw = String(password || "").slice(0, 200);
+    if (!pw) { noteFail(ctx.conn); return "denied"; }
+    var h = "";
+    try { h = sha256Hex(pw); } catch (e) { noteFail(ctx.conn); return "denied"; }
+    if (h !== ADMIN_PASSWORD_SHA256) { noteFail(ctx.conn); return "denied"; }
+    adminIds[ctx.conn.id] = true;
+    authFails[ctx.conn.id] = { fails: 0, until: 0 };
+    return "ok";
+  },
+  adminGetStats: function (ctx, data) {
+    if (!adminIds[ctx.conn.id]) throw new Error("unauthorized");
+    var db = loadDb();
+    var arr = [];
+    var keys = Object.keys(db.queries);
+    for (var i = 0; i < keys.length; i++) arr.push([keys[i], db.queries[keys[i]]]);
+    arr.sort(function (a, b) { return b[1] - a[1]; });
+    return JSON.stringify({ views: db.views, searches: db.searches, byDay: db.byDay, topQueries: arr.slice(0, 20), featuredCount: (db.featured || []).length });
+  },
+  adminSetFeatured: function (ctx, data) {
+    if (!adminIds[ctx.conn.id]) throw new Error("unauthorized");
+    var list;
+    try { list = JSON.parse(String(data || "[]")); } catch (e) { throw new Error("bad json"); }
+    if (!(list instanceof Array)) throw new Error("bad list");
+    if (list.length > 24) throw new Error("max 24");
+    var clean = [];
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i];
+      if (!it || typeof it !== "object") throw new Error("bad item");
+      var id = String(it.id || "").slice(0, 40);
+      var type = String(it.type || "movie").slice(0, 10);
+      if (type !== "movie" && type !== "series") type = "movie";
+      var name = String(it.name || "").slice(0, 120);
+      if (!id || !name) throw new Error("bad item");
+      clean.push({ id: id, type: type, name: name, poster: String(it.poster || "").slice(0, 500), year: String(it.year || "").slice(0, 4), rating: String(it.rating || "").slice(0, 10), description: "" });
+    }
+    var db = loadDb();
+    db.featured = clean;
+    saveDb(db);
+    return "ok";
+  }
+};
+</script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0b0d12;
+  --bg2: #12151d;
+  --card: #171b25;
+  --card2: #1e2430;
+  --text: #e8ecf3;
+  --muted: #8b95a8;
+  --accent: #ffb400;
+  --accent2: #ff5c5c;
+  --line: #262c3a;
+  --radius: 12px;
+}
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  min-height: 100vh;
+  padding-bottom: 70px;
+  text-align: left;
+}
+img { display: block; max-width: 100%; }
+button { font: inherit; cursor: pointer; border: none; background: none; color: inherit; }
+input { font: inherit; }
+a { color: inherit; text-decoration: none; }
+.hdr {
+  position: sticky; top: 0; z-index: 50;
+  background: rgba(11,13,18,0.85);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--line);
+}
+.hdrIn {
+  max-width: 1280px; margin: 0 auto;
+  display: flex; align-items: center; gap: 20px;
+  padding: 14px 20px;
+}
+.logo {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 20px; font-weight: 600; white-space: nowrap;
+}
+.logoMark { font-size: 22px; }
+.logo b { color: var(--accent); }
+.navDesk { display: flex; gap: 6px; margin-left: 12px; }
+.navDesk button {
+  padding: 8px 14px; border-radius: 8px;
+  color: var(--muted); font-size: 14px; font-weight: 500;
+  transition: all .15s;
+}
+.navDesk button:hover { color: var(--text); background: var(--card); }
+.navDesk button.on { color: var(--text); background: var(--card2); }
+.hdrSearch {
+  margin-left: auto; display: flex; align-items: center;
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 10px; overflow: hidden; max-width: 320px; flex: 1;
+}
+.hdrSearch input {
+  flex: 1; background: none; border: none; outline: none;
+  color: var(--text); padding: 9px 14px; font-size: 14px; min-width: 0;
+}
+.hdrSearch input::placeholder { color: var(--muted); }
+.iconBtn { padding: 9px 14px; font-size: 15px; }
+.iconBtn:hover { background: var(--card2); }
+.hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); }
+.heroBg {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(circle at 20% 30%, rgba(255,180,0,.15), transparent 50%),
+    radial-gradient(circle at 80% 70%, rgba(255,92,92,.12), transparent 50%),
+    linear-gradient(180deg, #12151d 0%, #0b0d12 100%);
+}
+.heroIn { position: relative; max-width: 1280px; margin: 0 auto; padding: 70px 20px 80px; text-align: center; }
+.kicker {
+  display: inline-block; padding: 6px 14px; margin-bottom: 20px;
+  background: rgba(255,180,0,.1); border: 1px solid rgba(255,180,0,.3);
+  border-radius: 999px; font-size: 13px; color: var(--accent); font-weight: 500;
+}
+.hero h1 { font-size: clamp(32px, 6vw, 56px); font-weight: 800; line-height: 1.1; letter-spacing: -0.02em; margin-bottom: 18px; }
+.hero h1 em { color: var(--accent); font-style: normal; }
+.hero p { color: var(--muted); max-width: 620px; margin: 0 auto 32px; font-size: clamp(15px, 2vw, 17px); }
+.bigSearch {
+  display: flex; max-width: 620px; margin: 0 auto 22px;
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 14px; overflow: hidden;
+  box-shadow: 0 20px 50px rgba(0,0,0,.4);
+}
+.bigSearch input { flex: 1; background: none; border: none; outline: none; color: var(--text); padding: 16px 20px; font-size: 16px; min-width: 0; }
+.bigSearch input::placeholder { color: var(--muted); }
+.bigSearch button { padding: 0 28px; background: var(--accent); color: #111; font-weight: 700; font-size: 15px; transition: background .15s; }
+.bigSearch button:hover { background: #ffc233; }
+.quickRow { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.quickRow button { padding: 8px 16px; background: var(--card); border: 1px solid var(--line); border-radius: 999px; font-size: 13px; color: var(--muted); transition: all .15s; }
+.quickRow button:hover { color: var(--text); border-color: var(--accent); }
+.sec { max-width: 1280px; margin: 0 auto; padding: 32px 20px; }
+.secHead { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 20px; gap: 12px; }
+.secHead h2 { font-size: 22px; font-weight: 700; }
+.secHead p { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.more { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.rail { display: flex; gap: 16px; overflow-x: auto; padding-bottom: 12px; scroll-snap-type: x mandatory; scrollbar-width: thin; }
+.rail::-webkit-scrollbar { height: 8px; }
+.rail::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+.rail > * { flex: 0 0 auto; scroll-snap-align: start; }
+.grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+.card { width: 180px; cursor: pointer; transition: transform .2s; }
+.card:hover { transform: translateY(-4px); }
+.cardPoster { position: relative; aspect-ratio: 2/3; background: var(--card2); border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); }
+.cardPoster img { width: 100%; height: 100%; object-fit: cover; }
+.cardPoster .noimg { display: flex; align-items: center; justify-content: center; height: 100%; font-size: 40px; opacity: .3; }
+.cardRating { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,.75); backdrop-filter: blur(4px); padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; color: var(--accent); }
+.cardType { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,.75); backdrop-filter: blur(4px); padding: 3px 8px; border-radius: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: #ccc; }
+.cardTitle { margin-top: 10px; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cardYear { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.grid .card { width: 100%; }
+.sk { width: 180px; aspect-ratio: 2/3; border-radius: var(--radius); background: linear-gradient(90deg, var(--card) 25%, var(--card2) 50%, var(--card) 75%); background-size: 200% 100%; animation: sk 1.4s infinite; }
+@keyframes sk { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.stateBox { text-align: center; padding: 60px 20px; color: var(--muted); }
+.stateBox .big { font-size: 60px; margin-bottom: 16px; }
+.stateBox h2 { color: var(--text); margin-bottom: 8px; }
+.detail { max-width: 1100px; margin: 0 auto; padding: 30px 20px; }
+.detailHero { display: flex; gap: 30px; flex-wrap: wrap; margin-bottom: 40px; }
+.detailPoster { flex: 0 0 260px; aspect-ratio: 2/3; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); background: var(--card2); }
+.detailPoster img { width: 100%; height: 100%; object-fit: cover; }
+.detailInfo { flex: 1; min-width: 260px; }
+.detailInfo h1 { font-size: 34px; font-weight: 800; margin-bottom: 8px; line-height: 1.15; }
+.detailMeta { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+.detailMeta .badge { padding: 3px 10px; background: var(--card); border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
+.detailMeta .star { color: var(--accent); font-weight: 700; }
+.detailDesc { color: #b8c0d0; margin-bottom: 22px; line-height: 1.7; }
+.detailCast { margin-bottom: 22px; }
+.detailCast h3 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
+.detailCast p { font-size: 14px; color: #c8d0e0; }
+.watchBtn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; background: var(--accent); color: #111; border-radius: 10px; font-weight: 700; font-size: 15px; transition: transform .15s; margin: 4px 8px 4px 0; }
+.watchBtn:hover { transform: translateY(-2px); }
+.watchBtn.sec { background: var(--card2); color: var(--text); border: 1px solid var(--line); }
+.freeBox { margin-top: 22px; padding: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+.freeBox h3 { font-size: 14px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin-bottom: 4px; }
+.freeBox p { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+.freeRow { display: flex; flex-wrap: wrap; gap: 8px; }
+.freeRow a { padding: 9px 14px; background: var(--card2); border: 1px solid var(--line); border-radius: 9px; font-size: 13px; font-weight: 600; }
+.freeRow a:hover { border-color: var(--accent); }
+.backBtn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; margin-bottom: 20px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; font-size: 14px; color: var(--muted); }
+.backBtn:hover { color: var(--text); }
+.legal { max-width: 1280px; margin: 40px auto 0; padding: 30px 20px; border-top: 1px solid var(--line); text-align: center; font-size: 13px; color: var(--muted); line-height: 1.7; }
+.legal b { color: var(--text); }
+.bottomNav { position: fixed; bottom: 0; left: 0; right: 0; z-index: 50; display: none; justify-content: space-around; background: rgba(11,13,18,0.95); backdrop-filter: blur(12px); border-top: 1px solid var(--line); padding: 8px 0 max(8px, env(safe-area-inset-bottom)); }
+.bottomNav button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 8px; color: var(--muted); font-size: 11px; }
+.bottomNav button i { font-size: 20px; font-style: normal; }
+.bottomNav button.on { color: var(--accent); }
+.modal { position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,.7); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; padding: 20px; }
+.modal[hidden] { display: none; }
+.modalBox { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 24px; max-width: 520px; width: 100%; max-height: 80vh; overflow: auto; }
+.modalBox h3 { margin-bottom: 14px; font-size: 20px; }
+.modalBox p { color: var(--muted); font-size: 14px; margin-bottom: 8px; }
+.modalBox .close { margin-top: 18px; padding: 10px 20px; background: var(--accent); color: #111; border-radius: 8px; font-weight: 600; }
+.adminWrap { max-width: 900px; margin: 0 auto; padding: 30px 20px; }
+.adminCard { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; margin-bottom: 18px; }
+.adminCard h2 { font-size: 20px; margin-bottom: 6px; }
+.adminCard p { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+.adminGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 6px; }
+.statNum { font-size: 28px; font-weight: 800; }
+.statLbl { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+.adminInput { width: 100%; background: var(--bg2); border: 1px solid var(--line); border-radius: 9px; color: var(--text); padding: 11px 13px; font-size: 14px; outline: none; }
+.adminInput:focus { border-color: var(--accent); }
+.adminBtn { padding: 11px 18px; background: var(--accent); color: #111; border-radius: 9px; font-weight: 700; font-size: 14px; }
+.adminBtn.ghost { background: var(--card2); color: var(--text); border: 1px solid var(--line); }
+.adminBtn.danger { background: transparent; border: 1px solid var(--accent2); color: var(--accent2); padding: 6px 12px; font-size: 12px; }
+.dayBars { display: flex; align-items: flex-end; gap: 5px; height: 110px; margin-top: 12px; }
+.dayBar { flex: 1; background: var(--accent); border-radius: 4px 4px 0 0; min-height: 3px; opacity: .85; }
+.dayLbls { display: flex; gap: 5px; margin-top: 6px; }
+.dayLbls span { flex: 1; font-size: 9px; color: var(--muted); text-align: center; overflow: hidden; }
+.qTable { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+.qTable td { padding: 7px 4px; border-bottom: 1px solid var(--line); }
+.qTable td:last-child { text-align: right; color: var(--muted); }
+.featItem { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.featItem img { width: 34px; height: 51px; object-fit: cover; border-radius: 6px; background: var(--card2); }
+.connDot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #3ddc84; margin-right: 6px; }
+@media (max-width: 720px) {
+  .navDesk { display: none; }
+  .hdrSearch { max-width: none; }
+  .bottomNav { display: flex; }
+  .heroIn { padding: 50px 20px 60px; }
+  .card { width: 150px; }
+  .sk { width: 150px; }
+  .detailHero { flex-direction: column; }
+  .detailPoster { flex: 0 0 auto; max-width: 220px; margin: 0 auto; }
+  .detailInfo h1 { font-size: 26px; }
+}
+@media (max-width: 480px) {
+  .hdrIn { padding: 10px 14px; gap: 10px; }
+  .logo { font-size: 17px; }
+  .hdrSearch input { padding: 8px 10px; font-size: 13px; }
+  .bigSearch button { padding: 0 18px; }
+}
+</style>
+
+<header class="hdr">
+  <div class="hdrIn">
+    <a class="logo" href="#/" aria-label="MovieFinder home">
+      <span class="logoMark">🎬</span><span>Movie<b>Finder</b></span>
+    </a>
+    <nav class="navDesk" aria-label="Primary">
+      <button data-nav="home" class="on">Home</button>
+      <button data-nav="search">Search</button>
+      <button data-nav="admin">Admin</button>
+    </nav>
+    <div class="hdrSearch">
+      <input id="hdrInput" type="search" placeholder="Quick search…" aria-label="Quick search" autocomplete="off">
+      <button class="iconBtn" id="hdrBtn" aria-label="Search">🔍</button>
+    </div>
+  </div>
+</header>
+
+<main id="homeView">
+  <section class="hero">
+    <div class="heroBg" id="heroBg"></div>
+    <div class="heroIn">
+      <span class="kicker">🍿 100% legal sources only</span>
+      <h1>Find it. <em>Watch it legally.</em></h1>
+      <p>Search movies, series and actors — ratings, cast, trailers and official streaming, rental &amp; purchase links.</p>
+      <div class="bigSearch">
+        <input id="bigInput" type="search" placeholder="Search movies, series, actors…" aria-label="Search movies, series, actors" autocomplete="off">
+        <button id="bigBtn" aria-label="Search">Search</button>
+      </div>
+      <div class="quickRow">
+        <button data-q="Dune">Dune</button>
+        <button data-q="Breaking Bad">Breaking Bad</button>
+        <button data-q="Spider-Man">Spider-Man</button>
+        <button data-q="The Last of Us">The Last of Us</button>
+        <button data-q="Interstellar">Interstellar</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="sec" id="featSec" hidden>
+    <div class="secHead"><div><h2>⭐ Featured</h2><p>Curated by the site owner</p></div></div>
+    <div class="rail" id="featRail"></div>
+  </div>
+  <div class="sec" id="trendSec">
+    <div class="secHead"><div><h2>🔥 Trending Movies</h2><p>Top-rated right now</p></div><span class="more">IMDb-ranked</span></div>
+    <div class="rail" id="trendRail"><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
+  </div>
+  <div class="sec" id="popSec">
+    <div class="secHead"><div><h2>🍿 Popular Movies</h2><p>Everyone is watching</p></div></div>
+    <div class="rail" id="popRail"><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
+  </div>
+  <div class="sec" id="newSec">
+    <div class="secHead"><div><h2>✨ Recently Added</h2><p>Fresh releases</p></div></div>
+    <div class="rail" id="newRail"><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
+  </div>
+  <div class="sec" id="seriesSec">
+    <div class="secHead"><div><h2>📺 Popular Series</h2><p>Binge-worthy shows</p></div></div>
+    <div class="rail" id="seriesRail"><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
+  </div>
+</main>
+
+<main id="searchView" hidden>
+  <div class="sec">
+    <div class="secHead"><div><h2 id="resTitle">Results</h2><p id="resCount"></p></div></div>
+    <div class="stateBox" id="emptyBox" hidden>
+      <div class="big">🎞️</div>
+      <h2>No matches found</h2>
+      <p id="emptyQ"></p>
+      <p>Check the spelling or try another title, actor or year.</p>
+    </div>
+    <div class="grid" id="resGrid"></div>
+  </div>
+</main>
+
+<main id="detailView" hidden>
+  <div class="detail" id="detailBox"></div>
+</main>
+
+<main id="adminView" hidden>
+  <div class="adminWrap">
+    <div class="adminCard" id="adminLoginCard">
+      <h2>Admin login</h2>
+      <p>Enter the admin password to view traffic and manage featured titles. Stored only as a hash in the code.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input class="adminInput" id="adminPwInput" type="password" placeholder="Admin password" autocomplete="current-password" style="flex:1;min-width:200px;">
+        <button class="adminBtn" id="adminLoginBtn">Login</button>
+      </div>
+      <p id="adminLoginMsg" style="margin-top:10px;"></p>
+    </div>
+    <div id="adminDash" hidden>
+      <div class="adminCard">
+        <h2><span class="connDot" id="adminConnDot"></span>Traffic <span id="adminConnLbl" style="font-size:12px;color:var(--muted);font-weight:400;"></span></h2>
+        <p>Live totals from all visitors (saved on the server, survives reloads after you save the generator).</p>
+        <div class="adminGrid">
+          <div><div class="statNum" id="statViews">–</div><div class="statLbl">Total visits</div></div>
+          <div><div class="statNum" id="statSearches">–</div><div class="statLbl">Total searches</div></div>
+          <div><div class="statNum" id="statFeat">–</div><div class="statLbl">Featured</div></div>
+        </div>
+        <div class="dayBars" id="dayBars"></div>
+        <div class="dayLbls" id="dayLbls"></div>
+      </div>
+      <div class="adminCard">
+        <h2>Top searches</h2>
+        <p>What visitors are looking for.</p>
+        <table class="qTable" id="qTable"><tr><td style="color:var(--muted)">No data yet.</td></tr></table>
+      </div>
+      <div class="adminCard">
+        <h2>Featured (home rail)</h2>
+        <p>Add by IMDb id, e.g. tt15398776 + type movie/series. Uses the same Cinemeta metadata as search.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+          <input class="adminInput" id="featTypeInput" value="movie" style="max-width:110px;">
+          <input class="adminInput" id="featIdInput" placeholder="tt15398776" style="flex:1;min-width:140px;">
+          <button class="adminBtn" id="featAddBtn">Add</button>
+          <button class="adminBtn ghost" id="adminRefreshBtn">Refresh stats</button>
+          <button class="adminBtn ghost" id="adminLogoutBtn">Logout</button>
+        </div>
+        <p id="featMsg"></p>
+        <div id="featList"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer class="legal">
+  <b>MovieFinder — legal viewing only.</b> <span id="visitCount" style="color:var(--muted);"></span><br>
+  Metadata by Cinemeta/Stremio. "Where to Watch" links open official platforms (JustWatch, Netflix, Prime Video, Disney+, Hulu, Max, Apple TV, YouTube Movies, Google Play) or owner-verified licensed sources.<br>
+  We never scrape, host, proxy or link to unauthorized downloads or copyrighted files.
+</footer>
+
+<nav class="bottomNav" aria-label="Mobile">
+  <button data-nav="home" class="on"><i>🏠</i>Home</button>
+  <button data-nav="search"><i>🔍</i>Search</button>
+  <button data-nav="admin"><i>⚙️</i>Admin</button>
+</nav>
+
+<div class="modal" id="modalCtn" hidden></div>
+
+<script>
+const CINEMETA = "https://v3-cinemeta.strem.io";
+const state = { view: "home", query: "", currentMeta: null, cache: new Map() };
+const $ = (id) => document.getElementById(id);
+const homeView = $("homeView");
+const searchView = $("searchView");
+const detailView = $("detailView");
+const detailBox = $("detailBox");
+const modalCtn = $("modalCtn");
+const resGrid = $("resGrid");
+const resTitle = $("resTitle");
+const resCount = $("resCount");
+const emptyBox = $("emptyBox");
+const emptyQ = $("emptyQ");
+const adminView = $("adminView");
+let srvSock = null;
+let srvReady = null;
+let srvWanted = true;
+let srvBackoff = 1000;
+let adminAuthed = false;
+function srvConnect() {
+  if (!srvWanted) return;
+  if (srvSock) { try { srvSock.close(1000, "reconnect"); } catch (e) {} srvSock = null; srvReady = null; }
+  let sock;
+  try { sock = root.createServerSocket(); }
+  catch (e) { setConnLbl(false, "server unavailable"); return; }
+  srvSock = sock;
+  sock.binaryType = "arraybuffer";
+  srvReady = sock.opened;
+  srvReady.then(() => {
+    srvBackoff = 1000;
+    setConnLbl(true, "live");
+    try { sock.rpc.trackView("home"); } catch (e) {}
+    const saved = sessionStorage.getItem("mf_admin") || "";
+    if (saved) adminAuth(saved, true);
+    loadFeatured();
+    refreshPublicCounter();
+  }).catch(() => {});
+  sock.closed.then((ev) => {
+    setConnLbl(false, "offline");
+    if (!srvWanted) return;
+    const code = ev && ev.code;
+    if (code === 4403) return;
+    let delay = srvBackoff;
+    if (code === 4429) {
+      const m = /(\d+)\s*s/i.exec(ev.reason || "");
+      delay = m ? parseInt(m[1], 10) * 1000 : 30000;
+    }
+    srvBackoff = Math.min(srvBackoff * 2, 30000);
+    setTimeout(() => { if (srvWanted) srvConnect(); }, delay + Math.random() * 500);
+  });
+}
+async function srvRpc(method, arg) {
+  if (!srvSock) throw new Error("offline");
+  await srvReady;
+  return await srvSock.rpc[method](arg == null ? "" : String(arg));
+}
+function setConnLbl(live, txt) {
+  const d = $("adminConnDot");
+  const l = $("adminConnLbl");
+  if (!d || !l) return;
+  d.style.background = live ? "#3ddc84" : "#888";
+  l.textContent = txt ? "(" + txt + ")" : "";
+}
+async function loadFeatured() {
+  try {
+    const raw = await srvRpc("getFeatured", "");
+    const list = JSON.parse(raw || "[]");
+    if (list && list.length) {
+      $("featSec").hidden = false;
+      renderRail($("featRail"), list);
+    }
+  } catch (e) {}
+}
+async function refreshPublicCounter() {
+  try {
+    const raw = await srvRpc("getPublicStats", "");
+    const s = JSON.parse(raw);
+    const el = $("visitCount");
+    if (el && typeof s.views === "number") el.textContent = s.views.toLocaleString() + " visits";
+  } catch (e) {}
+}
+async function adminAuth(pw, silent) {
+  const msg = $("adminLoginMsg");
+  try {
+    const r = await srvRpc("authenticateAdmin", pw);
+    if (r === "ok") {
+      adminAuthed = true;
+      sessionStorage.setItem("mf_admin", pw);
+      $("adminLoginCard").hidden = true;
+      $("adminDash").hidden = false;
+      if (msg) msg.textContent = "";
+      $("adminPwInput").value = "";
+      await adminRefresh();
+      return true;
+    }
+  } catch (e) {
+    if (!silent && msg) msg.textContent = "Server offline. Try again in a few seconds.";
+    return false;
+  }
+  if (!silent && msg) msg.textContent = "Wrong password.";
+  return false;
+}
+async function adminRefresh() {
+  try {
+    const raw = await srvRpc("adminGetStats", "");
+    const s = JSON.parse(raw);
+    $("statViews").textContent = (s.views || 0).toLocaleString();
+    $("statSearches").textContent = (s.searches || 0).toLocaleString();
+    $("statFeat").textContent = String(s.featuredCount || 0);
+    const days = Object.keys(s.byDay || {}).sort().slice(-14);
+    const bars = $("dayBars");
+    const lbls = $("dayLbls");
+    bars.innerHTML = "";
+    lbls.innerHTML = "";
+    const max = Math.max.apply(null, [1].concat(days.map((d) => s.byDay[d])));
+    days.forEach((d) => {
+      const v = s.byDay[d];
+      const b = document.createElement("div");
+      b.className = "dayBar";
+      b.style.height = Math.max(4, Math.round((v / max) * 100)) + "%";
+      b.title = d + ": " + v;
+      bars.appendChild(b);
+      const l = document.createElement("span");
+      l.textContent = d.slice(5);
+      lbls.appendChild(l);
+    });
+    const qt = $("qTable");
+    if (s.topQueries && s.topQueries.length) {
+      qt.innerHTML = s.topQueries.map((row) => `<tr><td>${escapeHTML(row[0])}</td><td>${escapeHTML(String(row[1]))}</td></tr>`).join("");
+    } else {
+      qt.innerHTML = `<tr><td style="color:var(--muted)">No searches yet.</td></tr>`;
+    }
+    renderFeatList();
+  } catch (e) {}
+}
+let adminFeatCache = [];
+async function renderFeatList() {
+  try {
+    const raw = await srvRpc("getFeatured", "");
+    adminFeatCache = JSON.parse(raw || "[]");
+  } catch (e) { adminFeatCache = []; }
+  const box = $("featList");
+  if (!adminFeatCache.length) { box.innerHTML = `<p style="color:var(--muted);font-size:13px;">No featured titles yet.</p>`; return; }
+  box.innerHTML = "";
+  adminFeatCache.forEach((it, idx) => {
+    const row = document.createElement("div");
+    row.className = "featItem";
+    const img = document.createElement("img");
+    img.src = it.poster || "";
+    img.alt = "";
+    img.addEventListener("error", () => img.remove());
+    const lbl = document.createElement("span");
+    lbl.style.flex = "1";
+    lbl.textContent = it.name + " (" + (it.year || "?") + ", " + it.type + ")";
+    const del = document.createElement("button");
+    del.className = "adminBtn danger";
+    del.textContent = "Remove";
+    del.addEventListener("click", async () => {
+      adminFeatCache.splice(idx, 1);
+      await srvRpc("adminSetFeatured", JSON.stringify(adminFeatCache));
+      await adminRefresh();
+      loadFeatured();
+    });
+    row.appendChild(img);
+    row.appendChild(lbl);
+    row.appendChild(del);
+    box.appendChild(row);
+  });
+}
+async function fetchJSON(url) {
+  if (state.cache.has(url)) return state.cache.get(url);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const data = await res.json();
+  state.cache.set(url, data);
+  return data;
+}
+async function searchCatalog(type, query) {
+  const url = `${CINEMETA}/catalog/${type}/top/search=${encodeURIComponent(query)}.json`;
+  try {
+    const data = await fetchJSON(url);
+    return (data.metas || []).map(normalizeMeta);
+  } catch (e) { console.warn("Search failed:", e); return []; }
+}
+async function getTop(type) {
+  const url = `${CINEMETA}/catalog/${type}/top.json`;
+  try {
+    const data = await fetchJSON(url);
+    return (data.metas || []).map(normalizeMeta);
+  } catch (e) { console.warn("Top failed:", e); return []; }
+}
+async function getMeta(type, id) {
+  const url = `${CINEMETA}/meta/${type}/${id}.json`;
+  const data = await fetchJSON(url);
+  return data.meta || null;
+}
+function normalizeMeta(m) {
+  return {
+    id: m.imdb_id || m.id,
+    type: m.type || "movie",
+    name: m.name || "Untitled",
+    poster: m.poster || "",
+    year: (m.releaseInfo || m.year || "").toString().slice(0, 4),
+    rating: m.imdbRating || "",
+    description: m.description || ""
+  };
+}
+function cardHTML(item) {
+  const poster = item.poster
+    ? `<img src="${escapeAttr(item.poster)}" alt="${escapeAttr(item.name)} poster" loading="lazy">`
+    : `<div class="noimg">🎬</div>`;
+  const rating = item.rating ? `<span class="cardRating">★ ${escapeHTML(item.rating)}</span>` : "";
+  const typeLabel = item.type === "series" ? "Series" : "Movie";
+  return `<div class="card" data-id="${escapeAttr(item.id)}" data-type="${escapeAttr(item.type)}"><div class="cardPoster">${poster}${rating}<span class="cardType">${typeLabel}</span></div><div class="cardTitle" title="${escapeAttr(item.name)}">${escapeHTML(item.name)}</div><div class="cardYear">${escapeHTML(item.year || "")}</div></div>`;
+}
+function renderRail(el, items) {
+  if (!items.length) { el.innerHTML = `<p style="color:var(--muted);padding:20px 0;">Nothing to show yet.</p>`; return; }
+  el.innerHTML = items.map(cardHTML).join("");
+  bindCards(el);
+}
+function bindCards(root) {
+  root.querySelectorAll(".card").forEach((c) => {
+    c.addEventListener("click", () => openDetail(c.dataset.type, c.dataset.id));
+  });
+  root.querySelectorAll(".cardPoster img").forEach((img) => {
+    img.addEventListener("error", () => {
+      const d = document.createElement("div");
+      d.className = "noimg";
+      d.textContent = "🎬";
+      img.replaceWith(d);
+    });
+  });
+}
+async function loadHome() {
+  getTop("movie").then((items) => {
+    const sorted = items.filter((i) => i.rating).sort((a, b) => parseFloat(b.rating) - parseFloat(a.rating)).slice(0, 12);
+    renderRail($("trendRail"), sorted.length ? sorted : items.slice(0, 12));
+  });
+  getTop("movie").then((items) => { renderRail($("popRail"), items.slice(0, 12)); });
+  getTop("movie").then((items) => { renderRail($("newRail"), items.slice(-12).reverse()); });
+  getTop("series").then((items) => { renderRail($("seriesRail"), items.slice(0, 12)); });
+}
+async function runSearch(query) {
+  query = (query || "").trim();
+  if (!query) return;
+  state.query = query;
+  try { if (srvSock) { srvReady.then(() => { try { srvSock.rpc.trackSearch(query); } catch (e) {} }); } } catch (e) {}
+  showView("search");
+  resTitle.textContent = `Results for "${query}"`;
+  resCount.textContent = "Searching…";
+  emptyBox.hidden = true;
+  resGrid.innerHTML = `<div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div>`;
+  const [movies, series] = await Promise.all([searchCatalog("movie", query), searchCatalog("series", query)]);
+  const all = [...movies, ...series];
+  const seen = new Set();
+  const unique = all.filter((i) => {
+    if (!i.id || seen.has(i.id)) return false;
+    seen.add(i.id);
+    return true;
+  });
+  if (!unique.length) {
+    resGrid.innerHTML = "";
+    resCount.textContent = "";
+    emptyQ.textContent = `No results for "${query}".`;
+    emptyBox.hidden = false;
+    return;
+  }
+  resCount.textContent = `${unique.length} result${unique.length === 1 ? "" : "s"}`;
+  resGrid.innerHTML = unique.map(cardHTML).join("");
+  bindCards(resGrid);
+}
+async function openDetail(type, id) {
+  if (!id) return;
+  showView("detail");
+  detailBox.innerHTML = `<p style="color:var(--muted);padding:40px 0;text-align:center;">Loading…</p>`;
+  try {
+    const meta = await getMeta(type, id);
+    if (!meta) throw new Error("No metadata");
+    state.currentMeta = meta;
+    renderDetail(meta);
+  } catch (e) {
+    detailBox.innerHTML = `<button class="backBtn" id="errBackBtn">← Back</button><div class="stateBox"><div class="big">😕</div><h2>Couldn't load details</h2><p>${escapeHTML(e.message)}</p></div>`;
+    $("errBackBtn").addEventListener("click", () => { if (state.query) runSearch(state.query); else showView("home"); });
+  }
+}
+function renderDetail(meta) {
+  const poster = meta.poster
+    ? `<img src="${escapeAttr(meta.poster)}" alt="${escapeAttr(meta.name)} poster">`
+    : `<div class="noimg" style="display:flex;align-items:center;justify-content:center;height:100%;font-size:60px;opacity:.3;">🎬</div>`;
+  const year = (meta.releaseInfo || meta.year || "").toString().slice(0, 4);
+  const runtime = meta.runtime ? `<span class="badge">${escapeHTML(meta.runtime)}</span>` : "";
+  const rating = meta.imdbRating ? `<span class="star">★ ${escapeHTML(meta.imdbRating)}</span>` : "";
+  const genres = (meta.genres || []).slice(0, 4).map((g) => `<span class="badge">${escapeHTML(g)}</span>`).join("");
+  const cast = (meta.cast || []).slice(0, 8).join(", ");
+  const director = (meta.director || []).join(", ");
+  const typeLabel = meta.type === "series" ? "Series" : "Movie";
+  const watchQuery = encodeURIComponent(`${meta.name} ${year}`.trim());
+  const justwatch = `https://www.justwatch.com/us/search?q=${watchQuery}`;
+  const trailerQ = encodeURIComponent(`${meta.name} ${year} official trailer`);
+  const trailerUrl = `https://www.youtube.com/results?search_query=${trailerQ}`;
+  const tubiUrl = `https://tubitv.com/search/${watchQuery}`;
+  const plexUrl = `https://watch.plex.tv/search?query=${watchQuery}`;
+  const ytFreeUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(meta.name + " full movie free official")}`;
+  const archiveUrl = `https://archive.org/search?query=${watchQuery}+AND+mediatype%3Amovies`;
+  detailBox.innerHTML = `<button class="backBtn" id="backBtn">← Back</button><div class="detailHero"><div class="detailPoster">${poster}</div><div class="detailInfo"><h1>${escapeHTML(meta.name)}</h1><div class="detailMeta">${rating}<span>${escapeHTML(year)}</span><span class="badge">${typeLabel}</span>${runtime}${genres}</div><p class="detailDesc">${escapeHTML(meta.description || "No description available.")}</p>${director ? `<div class="detailCast"><h3>Director</h3><p>${escapeHTML(director)}</p></div>` : ""}${cast ? `<div class="detailCast"><h3>Cast</h3><p>${escapeHTML(cast)}</p></div>` : ""}<a class="watchBtn" href="${justwatch}" target="_blank" rel="noopener">▶ Where to Watch</a><a class="watchBtn sec" href="${trailerUrl}" target="_blank" rel="noopener">🎬 Trailer</a><p style="color:var(--muted);font-size:12px;margin-top:12px;">Opens JustWatch — official streaming, rental &amp; purchase options.</p><div class="freeBox"><h3>Watch Free (Legal)</h3><p>Free official sources. Availability varies by title and region.</p><div class="freeRow"><a href="${tubiUrl}" target="_blank" rel="noopener">Tubi</a><a href="${plexUrl}" target="_blank" rel="noopener">Plex Free</a><a href="${ytFreeUrl}" target="_blank" rel="noopener">YouTube Free</a><a href="${archiveUrl}" target="_blank" rel="noopener">Archive.org</a></div></div></div></div>`;
+  $("backBtn").addEventListener("click", () => { if (state.query) { runSearch(state.query); } else { showView("home"); } });
+  document.title = `${meta.name} — MovieFinder`;
+}
+function showView(name) {
+  state.view = name;
+  homeView.hidden = name !== "home";
+  searchView.hidden = name !== "search";
+  detailView.hidden = name !== "detail";
+  adminView.hidden = name !== "admin";
+  document.querySelectorAll("[data-nav]").forEach((b) => { b.classList.toggle("on", b.dataset.nav === name); });
+  if (name === "home") { document.title = "MovieFinder — Find it. Watch it legally."; window.scrollTo({ top: 0, behavior: "smooth" }); }
+  if (name === "admin" && adminAuthed) adminRefresh();
+}
+function openModal(html) {
+  modalCtn.innerHTML = `<div class="modalBox">${html}</div>`;
+  modalCtn.hidden = false;
+  modalCtn.onclick = (e) => { if (e.target === modalCtn) closeModal(); };
+}
+function closeModal() { modalCtn.hidden = true; modalCtn.innerHTML = ""; }
+window.closeModal = closeModal;
+function wireEvents() {
+  document.querySelectorAll(".navDesk [data-nav]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const n = b.dataset.nav;
+      if (n === "home") showView("home");
+      else if (n === "search") {
+        showView("search");
+        if (!state.query) {
+          resTitle.textContent = "Search";
+          resCount.textContent = "Type in the search box above to find movies & series.";
+          resGrid.innerHTML = "";
+          emptyBox.hidden = true;
+        }
+      } else if (n === "admin") showView("admin");
+    });
+  });
+  document.querySelectorAll(".bottomNav [data-nav]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const n = b.dataset.nav;
+      if (n === "home") showView("home");
+      else if (n === "search") showView("search");
+      else if (n === "admin") showView("admin");
+      document.querySelectorAll(".bottomNav [data-nav]").forEach((x) => x.classList.toggle("on", x.dataset.nav === n));
+    });
+  });
+  $("bigBtn").addEventListener("click", () => runSearch($("bigInput").value));
+  $("bigInput").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch($("bigInput").value); });
+  $("hdrBtn").addEventListener("click", () => runSearch($("hdrInput").value));
+  $("hdrInput").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch($("hdrInput").value); });
+  document.querySelectorAll(".quickRow button").forEach((b) => {
+    b.addEventListener("click", () => { $("bigInput").value = b.dataset.q; runSearch(b.dataset.q); });
+  });
+  $("adminLoginBtn").addEventListener("click", () => adminAuth($("adminPwInput").value, false));
+  $("adminPwInput").addEventListener("keydown", (e) => { if (e.key === "Enter") adminAuth($("adminPwInput").value, false); });
+  $("adminLogoutBtn").addEventListener("click", () => {
+    adminAuthed = false;
+    sessionStorage.removeItem("mf_admin");
+    $("adminDash").hidden = true;
+    $("adminLoginCard").hidden = false;
+  });
+  $("adminRefreshBtn").addEventListener("click", adminRefresh);
+  $("featAddBtn").addEventListener("click", async () => {
+    const msg = $("featMsg");
+    const id = $("featIdInput").value.trim();
+    const type = ($("featTypeInput").value.trim() || "movie").toLowerCase();
+    if (!id) { msg.textContent = "Enter an IMDb id."; return; }
+    msg.textContent = "Fetching metadata…";
+    try {
+      const meta = await getMeta(type === "series" ? "series" : "movie", id);
+      if (!meta) throw new Error("not found");
+      adminFeatCache.push({
+        id: meta.imdb_id || meta.id || id,
+        type: meta.type || type,
+        name: meta.name || id,
+        poster: meta.poster || "",
+        year: (meta.releaseInfo || meta.year || "").toString().slice(0, 4),
+        rating: meta.imdbRating || ""
+      });
+      await srvRpc("adminSetFeatured", JSON.stringify(adminFeatCache));
+      $("featIdInput").value = "";
+      msg.textContent = "Added.";
+      await adminRefresh();
+      loadFeatured();
+    } catch (e) { msg.textContent = "Could not add: " + e.message; }
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !modalCtn.hidden) closeModal(); });
+}
+function escapeHTML(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function escapeAttr(s) { return escapeHTML(s); }
+wireEvents();
+showView("home");
+loadHome();
+srvConnect();
+</script>
